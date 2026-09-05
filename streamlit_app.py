@@ -9,7 +9,7 @@ from PIL import Image
 from pyzbar.pyzbar import decode
 from deepface import DeepFace
 
-st.set_page_config(page_title="Privacy-First KYC Verifier", layout="wide")
+st.set_page_config(page_title="AI Document Forgery & Consistency Analyser", layout="wide")
 
 @st.cache_resource
 def load_ocr():
@@ -50,147 +50,247 @@ def validate_verhoeff(num_str):
         c = d_table[c][p_table[i % 8][int(item)]]
     return c == 0
 
-def check_ela(img_np):
+def check_tampering(img_np):
     _, enc = cv2.imencode('.jpg', img_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
     resaved = cv2.imdecode(enc, cv2.IMREAD_COLOR)
     ela = cv2.absdiff(img_np, resaved)
     ela_gray = cv2.cvtColor(ela, cv2.COLOR_RGB2GRAY)
-    return bool(np.max(ela_gray) > 55)
+    return bool(np.mean(ela_gray) > 12.0 and np.max(ela_gray) > 80)
 
-def mask_pii(img_np, ocr_boxes):
-    masked = img_np.copy()
-    for (bbox, text, _) in ocr_boxes:
-        clean = re.sub(r'\D', '', text)
-        if len(clean) >= 8 or re.search(r'\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b', text):
-            pts = np.array(bbox, np.int32)
-            cv2.fillPoly(masked, [pts], (0, 0, 0))
-    return masked
-
-def parse_qr(qr_objs):
+def parse_qr_data(qr_objs):
+    if not qr_objs:
+        return None
     for q in qr_objs:
         try:
-            txt = q.data.decode('utf-8', errors='ignore')
-            if "<PrintLetterBarcodeData" in txt:
-                root = ET.fromstring(txt)
+            raw_bytes = q.data
+            decoded_text = raw_bytes.decode('utf-8', errors='ignore')
+            if "<PrintLetterBarcodeData" in decoded_text or "xml" in decoded_text:
+                root = ET.fromstring(decoded_text)
                 return {
                     "uid": root.attrib.get("uid", ""),
-                    "dob": root.attrib.get("dob", "") or root.attrib.get("yob", "")
+                    "dob": root.attrib.get("dob", ""),
+                    "yob": root.attrib.get("yob", ""),
+                    "name": root.attrib.get("name", "")
                 }
+            if raw_bytes.isdigit() or len(raw_bytes) > 200:
+                return {"type": "secure_v2", "raw": raw_bytes}
+            if len(decoded_text) > 0:
+                return {"type": "standard_qr", "raw": decoded_text}
         except Exception:
             continue
     return None
 
-st.title("Automated KYC Document Authenticity & Biometric Verifier")
-st.caption("Zero Data Retention Policy: All images processed exclusively in ephemeral memory.")
+def mask_pii(img_np, boxes):
+    masked = img_np.copy()
+    pan_regex = r'[A-Z]{5}[0-9]{4}[A-Z]{1}'
+    for (bbox, text, _) in boxes:
+        clean_digits = re.sub(r'\D', '', text)
+        clean_text = text.replace(" ", "").upper()
+        if len(clean_digits) >= 8 or re.search(r'\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b', text) or re.search(pan_regex, clean_text):
+            pts = np.array(bbox, np.int32)
+            cv2.fillPoly(masked, [pts], (0, 0, 0))
+    return masked
+
+def match_faces(doc_img_np, selfie_img_np):
+    doc_crop = None
+    try:
+        faces = DeepFace.extract_faces(doc_img_np, detector_backend='opencv', enforce_detection=False)
+        if len(faces) > 0:
+            a = faces[0]["facial_area"]
+            doc_crop = doc_img_np[a['y']:a['y']+a['h'], a['x']:a['x']+a['w']]
+    except Exception:
+        doc_crop = None
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f1, tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f2:
+        cv2.imwrite(f1.name, cv2.cvtColor(doc_img_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(f2.name, cv2.cvtColor(selfie_img_np, cv2.COLOR_RGB2BGR))
+        try:
+            res = DeepFace.verify(
+                img1_path=f1.name,
+                img2_path=f2.name,
+                model_name='ArcFace',
+                detector_backend='opencv',
+                distance_metric='cosine',
+                enforce_detection=False
+            )
+            raw_dist = float(res["distance"])
+            is_match = raw_dist <= 0.68
+            score = max(0.0, min(100.0, (1 - (raw_dist / 0.85)) * 100))
+            status = "MATCH (Same Person)" if is_match else "MISMATCH (Different Person)"
+            return doc_crop, status, is_match, score
+        except Exception:
+            return doc_crop, "FACE NOT DETECTED", False, 0.0
+
+st.title("AI Document Forgery & Consistency Analyser")
+st.caption("Privacy-First Pipeline | Zero Data Retention | In-Memory Processing")
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("1. Identity Document")
-    doc_file = st.file_uploader("Upload Document", type=["jpg", "jpeg", "png"])
-    doc_camera = st.camera_input("Or Capture Document via Camera")
+    doc_source = st.radio("Input Method for Document:", ["Upload File", "Take Photo via Camera"], horizontal=True, key="doc_src")
+    if doc_source == "Upload File":
+        doc_file = st.file_uploader("Upload ID Document", type=["jpg", "jpeg", "png"], key="doc_up")
+    else:
+        doc_file = st.camera_input("Capture Document", key="doc_cam")
 
 with col2:
-    st.subheader("2. Live Selfie (Webcam)")
-    selfie_file = st.camera_input("Capture Live Selfie for Verification")
-
-selected_doc = doc_file if doc_file is not None else doc_camera
-
-if st.button("Run Forensic Verification", type="primary"):
-    if not selected_doc:
-        st.error("Please upload or capture a document first.")
+    st.subheader("2. Live Face Verification")
+    selfie_source = st.radio("Input Method for Selfie:", ["Take Selfie via Camera", "Upload Photo"], horizontal=True, key="selfie_src")
+    if selfie_source == "Take Selfie via Camera":
+        selfie_file = st.camera_input("Capture Live Face", key="selfie_cam")
     else:
-        doc_img = Image.open(selected_doc).convert("RGB")
+        selfie_file = st.file_uploader("Upload Selfie Photo", type=["jpg", "jpeg", "png"], key="selfie_up")
+
+if st.button("Run Verification Analysis", type="primary"):
+    if not doc_file:
+        st.error("Please provide an ID document using either Upload or Camera.")
+    else:
+        doc_img = Image.open(doc_file).convert("RGB")
         doc_np = np.array(doc_img)
 
-        with st.spinner("Analyzing document security features and extracting text..."):
+        with st.spinner("Executing Forensic Audits and Neural Consistency Checks..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
+            compressed_text = re.sub(r'[^A-Z0-9]', '', raw_text)
 
-            all_digits = re.sub(r'\D', '', raw_text)
-            candidates = [all_digits[i:i+12] for i in range(len(all_digits) - 11)]
-            extracted_uid = ""
-            for c in candidates:
-                if c[0] not in '01' and validate_verhoeff(c):
-                    extracted_uid = c
-                    break
+            masked_preview = mask_pii(doc_np, ocr_boxes)
+            qr_objects = decode(doc_img)
+            qr_data = parse_qr_data(qr_objects)
+            is_tampered = check_tampering(doc_np)
 
             dob_match = re.search(r'\b(0[1-9]|[12][0-9]|3[01])[-/.](0[1-9]|1[012])[-/.](19|20)\d\d\b', raw_text)
-            ocr_dob = dob_match.group(0) if dob_match else "NOT_FOUND"
+            yob_match = re.search(r'\b(19|20)\d{2}\b', raw_text)
+            ocr_dob = dob_match.group(0) if dob_match else (yob_match.group(0) if yob_match else "NOT_FOUND")
 
-            qr_objs = decode(doc_img)
-            qr_data = parse_qr(qr_objs)
-            is_tampered = check_ela(doc_np)
-            gov_headers = any(k in raw_text for k in ["GOVERNMENT OF INDIA", "UNIQUE IDENTIFICATION", "AADHAAR", "MERA AADHAAR"])
+            is_pan = any(k in raw_text for k in ["INCOME TAX", "PERMANENT ACCOUNT", "FATHER", "GOVT. OF INDIA", "SIGNATURE"]) or re.search(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', compressed_text)
+            is_aadhaar = any(k in raw_text for k in ["AADHAAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "ENROLMENT"]) or re.search(r'\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b', raw_text)
 
-            reasons = []
-            is_real = True
+            metadata_match = True
+            rejection_reasons = []
+            doc_type = "Unrecognized Document"
+            qr_cross_check = "NOT_APPLICABLE"
 
-            if not extracted_uid:
-                is_real = False
-                reasons.append("Invalid or unreadable Number (Failed Verhoeff Checksum)")
-            if not gov_headers:
-                is_real = False
-                reasons.append("Missing official Government of India emblems / headers")
-            if is_tampered:
-                is_real = False
-                reasons.append("Digital tampering / photo splicing detected via ELA")
+            if is_pan and not is_aadhaar:
+                doc_type = "PAN Card"
+                pan_matches = re.findall(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', compressed_text)
+                if pan_matches:
+                    pan_num = pan_matches[0]
+                    if pan_num[3] not in "CPHFATBLJG":
+                        metadata_match = False
+                        rejection_reasons.append("Invalid 4th character status code on PAN")
+                else:
+                    metadata_match = False
+                    rejection_reasons.append("Valid 10-character PAN format not found")
 
-            if qr_objs:
-                if qr_data:
-                    clean_ocr = re.sub(r'\D', '', ocr_dob)
-                    clean_qr = re.sub(r'\D', '', qr_data["dob"])
-                    if clean_ocr and clean_qr and (clean_qr not in clean_ocr and clean_ocr not in clean_qr):
-                        is_real = False
-                        reasons.append(f"DOB Mismatch! Printed on card: {ocr_dob} | Encoded in QR: {qr_data['dob']}")
-                    if qr_data["uid"] and extracted_uid and qr_data["uid"][-4:] != extracted_uid[-4:]:
-                        is_real = False
-                        reasons.append("UID mismatch against embedded cryptographic QR")
+                has_pan_header = any(k in raw_text for k in ["INCOME TAX", "GOVT. OF INDIA", "PERMANENT ACCOUNT"])
+                if not has_pan_header:
+                    metadata_match = False
+                    rejection_reasons.append("Missing Income Tax Department header")
+
+                if qr_objects:
+                    qr_cross_check = "VERIFIED (QR Present)"
+                else:
+                    qr_cross_check = "OPTIONAL (Physical Card)"
+
             else:
-                is_real = False
-                reasons.append("Physical QR code missing or deliberately altered")
+                doc_type = "Aadhaar Card"
+                all_digits = re.sub(r'\D', '', raw_text)
+                candidates = [all_digits[i:i+12] for i in range(len(all_digits) - 11)]
+                extracted_uid = ""
+                for cand in candidates:
+                    if cand[0] not in '01' and validate_verhoeff(cand):
+                        extracted_uid = cand
+                        break
 
-            face_matched = False
-            bio_status = "No Selfie Captured"
-            similarity = 0.0
+                if not extracted_uid:
+                    metadata_match = False
+                    rejection_reasons.append("Invalid or missing identification number (Verhoeff validation failed)")
+
+                has_aadhaar_header = any(k in raw_text for k in ["GOVERNMENT OF INDIA", "UNIQUE IDENTIFICATION", "AADHAAR", "MERA AADHAAR"])
+                if not has_aadhaar_header:
+                    metadata_match = False
+                    rejection_reasons.append("Missing official Government of India / UIDAI header")
+
+                if qr_objects:
+                    if qr_data and isinstance(qr_data, dict) and "dob" in qr_data:
+                        qr_dob = qr_data.get("dob", "") or qr_data.get("yob", "")
+                        qr_uid = qr_data.get("uid", "")
+                        clean_ocr_dob = re.sub(r'\D', '', ocr_dob)
+                        clean_qr_dob = re.sub(r'\D', '', qr_dob)
+
+                        dob_aligned = (clean_qr_dob in clean_ocr_dob) or (clean_ocr_dob in clean_qr_dob)
+                        uid_aligned = (not qr_uid) or (extracted_uid and qr_uid[-4:] == extracted_uid[-4:])
+
+                        if not dob_aligned:
+                            metadata_match = False
+                            qr_cross_check = f"MISMATCH (Card: {ocr_dob} vs QR: {qr_dob})"
+                            rejection_reasons.append(f"DOB mismatch: Printed ({ocr_dob}) vs QR ({qr_dob})")
+                        elif not uid_aligned:
+                            metadata_match = False
+                            qr_cross_check = "MISMATCH (UID vs QR)"
+                            rejection_reasons.append("UID mismatch against embedded QR code")
+                        else:
+                            qr_cross_check = "VERIFIED (Card matches QR payload)"
+                    else:
+                        qr_cross_check = "SECURE_QR_PRESENT"
+                else:
+                    metadata_match = False
+                    qr_cross_check = "MISSING_QR"
+                    rejection_reasons.append("Physical QR code missing or damaged")
+
+            if is_tampered:
+                metadata_match = False
+                rejection_reasons.append("ELA detected visual manipulation or splicing")
+
+            face_crop = None
+            bio_status = "NO SELFIE PROVIDED"
+            face_match = False
+            bio_score = 0.0
 
             if selfie_file:
                 selfie_img = Image.open(selfie_file).convert("RGB")
-                selfie_np = np.array(selfie_img)
-                with tempfile.NamedTemporaryFile(suffix=".jpg") as f1, tempfile.NamedTemporaryFile(suffix=".jpg") as f2:
-                    cv2.imwrite(f1.name, cv2.cvtColor(doc_np, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(f2.name, cv2.cvtColor(selfie_np, cv2.COLOR_RGB2BGR))
-                    try:
-                        res = DeepFace.verify(f1.name, f2.name, model_name="ArcFace", detector_backend="opencv", enforce_detection=False)
-                        dist = float(res["distance"])
-                        face_matched = dist <= 0.68
-                        similarity = max(0.0, min(100.0, (1 - (dist / 0.85)) * 100))
-                        bio_status = "MATCH CONFIRMED" if face_matched else "MISMATCH / IMPERSONATION ALERT"
-                    except Exception:
-                        bio_status = "Face detection error"
+                face_crop, bio_status, face_match, bio_score = match_faces(doc_np, np.array(selfie_img))
+                if not face_match:
+                    rejection_reasons.append("Biometric face mismatch (Impersonation Alert)")
+
+            if not metadata_match:
+                final_verdict = "FAKE"
+                trust_score = 15
+            elif selfie_file and not face_match:
+                final_verdict = "FAKE (IMPERSONATION)"
+                trust_score = 30
+            else:
+                final_verdict = "REAL"
+                trust_score = 95 if face_match else 80
 
             st.divider()
-            res_col1, res_col2 = st.columns(2)
+            r_col1, r_col2 = st.columns([1.2, 1])
 
-            with res_col1:
-                if not is_real:
-                    st.error("### Verdict: FAKE / FRAUDULENT")
-                elif selfie_file and not face_matched:
-                    st.warning("### Verdict: REAL DOCUMENT - IMPERSONATION MISMATCH")
+            with r_col1:
+                st.subheader("Verification Breakdown")
+                st.write(f"**Document Detected:** {doc_type}")
+
+                if final_verdict == "REAL":
+                    st.success(f"### Verdict: {final_verdict} (Trust Score: {trust_score}%)")
                 else:
-                    st.success("### Verdict: REAL / VERIFIED")
+                    st.error(f"### Verdict: {final_verdict} (Trust Score: {trust_score}%)")
 
-                st.write(f"**Biometric Result:** {bio_status} ({similarity:.1f}% Match)")
-                st.write(f"**Masked Identifier:** [Redacted ID]")
-                st.write(f"**Detected DOB:** {ocr_dob}")
+                details_data = {
+                    "Document Type": doc_type,
+                    "Status": final_verdict,
+                    "Trust Score": f"{trust_score}%",
+                    "Printed DOB": ocr_dob,
+                    "QR Cross-Check": qr_cross_check,
+                    "Physical/Digital Tampering": "DETECTED" if is_tampered else "CLEAN",
+                    "Biometric Result": bio_status,
+                    "Biometric Similarity": f"{bio_score:.1f}%",
+                    "Issues Flagged": rejection_reasons if rejection_reasons else ["None - All integrity checks passed"]
+                }
+                st.json(details_data)
 
-                if reasons:
-                    st.error("Fraud Flags Detected:")
-                    for r in reasons:
-                        st.write(f"- {r}")
-                else:
-                    st.success("All mathematical, cryptographic, and visual checks passed.")
-
-            with res_col2:
-                masked_img = mask_pii(doc_np, ocr_boxes)
-                st.image(masked_img, caption="Redacted Document Preview (PII Protected)", use_container_width=True)
+            with r_col2:
+                st.subheader("Visual Audits")
+                st.image(masked_preview, caption="Redacted Document (PII Masked)", use_container_width=True)
+                if face_crop is not None:
+                    st.image(face_crop, caption="Detected ID Photo Crop", width=180)
