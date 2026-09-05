@@ -1,7 +1,8 @@
 streamlit
 opencv-python-headless
 easyocr
-deepface
+tensorflow-cpu==2.15.0
+tf-keras==2.15.0
+deepface==0.0.93
 pillow
 pyzbar
-tf-keras
