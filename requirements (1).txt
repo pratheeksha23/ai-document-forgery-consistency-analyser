@@ -1,5 +1,5 @@
 streamlit
-opencv-python-headless==4.10.0.84
+opencv-python-headless
 easyocr==1.7.2
 deepface>=0.0.93
 pillow
