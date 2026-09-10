@@ -30,4 +30,28 @@ An identity verification and document forensics web application built with Strea
 ---
 
 ## System Architecture
+ID Document / Live Capture
+│
+├──► Preprocessing & Contrast Balancing (CLAHE)
+│           │
+│           ├──► EasyOCR Engine ──► Regex & Verhoeff Validations
+│           ├──► pyzbar ──────────► Cryptographic QR Extraction
+│           └──► ELA Module ──────► Digital Splicing Detection
+│
+└──► Facial Crop Detection
+│
+Live Selfie ─────────┴──► Histogram Correlation & Template Normalization
+│
+Audit Verdict & Trust Score
+
+
+---
+
+## Tech Stack
+
+- **Framework:** Streamlit
+- **Optical Character Recognition:** EasyOCR
+- **Computer Vision:** OpenCV (headless), NumPy, Pillow
+- **Barcode & QR Decoding:** pyzbar
+- **Security & Integrity:** Verhoeff Algorithm, Error Level Analysis (ELA)
 
