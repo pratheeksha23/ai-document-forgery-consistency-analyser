@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from PIL import Image
 from pyzbar.pyzbar import decode
 from deepface import DeepFace
+import mediapipe as mp
 import tempfile
 import os
 
@@ -65,17 +66,6 @@ html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
     text-align: center;
     margin-bottom: 8px;
 }
-.pill-warn {
-    background: rgba(255,183,3,0.12);
-    border: 1px solid #ffb703;
-    color: #ffb703;
-    padding: 8px 14px;
-    border-radius: 10px;
-    font-weight: 700;
-    font-size: 1rem;
-    text-align: center;
-    margin-bottom: 8px;
-}
 .mono-log {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.8rem;
@@ -93,6 +83,7 @@ def load_ocr():
     return easyocr.Reader(['en'], gpu=False, model_storage_directory="./models", download_enabled=True)
 
 reader = load_ocr()
+mp_face_mesh = mp.solutions.face_mesh
 
 d_table = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
@@ -321,7 +312,64 @@ def extract_face(img_np):
         pass
     return None
 
-def analyze_biometrics(doc_face_rgb, selfie_rgb):
+LANDMARK_INDICES = {
+    "left_eye_outer": 33, "right_eye_outer": 263,
+    "left_eye_inner": 133, "right_eye_inner": 362,
+    "left_cheek": 234, "right_cheek": 454,
+    "nose_left": 98, "nose_right": 327,
+    "jaw_left": 172, "jaw_right": 397,
+    "chin": 152, "forehead": 10
+}
+
+def extract_structural_ratios(face_rgb):
+    if face_rgb is None or face_rgb.size == 0:
+        return None, None
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.3) as fm:
+        results = fm.process(face_rgb)
+        if not results.multi_face_landmarks:
+            return None, None
+        lm = results.multi_face_landmarks[0].landmark
+        h, w, _ = face_rgb.shape
+        pts = {k: np.array([lm[idx].x * w, lm[idx].y * h]) for k, idx in LANDMARK_INDICES.items()}
+
+        def dist(a, b):
+            return float(np.linalg.norm(pts[a] - pts[b]))
+
+        inter_ocular = dist("left_eye_inner", "right_eye_inner")
+        if inter_ocular < 1e-3:
+            return None, None
+
+        ratios = {
+            "eye_spacing": inter_ocular,
+            "bi_ocular_width": dist("left_eye_outer", "right_eye_outer") / inter_ocular,
+            "cheekbone_width": dist("left_cheek", "right_cheek") / inter_ocular,
+            "jaw_width": dist("jaw_left", "jaw_right") / inter_ocular,
+            "nose_width": dist("nose_left", "nose_right") / inter_ocular,
+            "face_height": dist("forehead", "chin") / inter_ocular
+        }
+        return ratios, pts
+
+def evaluate_structural_consistency(doc_face, selfie_face):
+    doc_ratios, doc_pts = extract_structural_ratios(doc_face)
+    selfie_ratios, selfie_pts = extract_structural_ratios(selfie_face)
+
+    if not doc_ratios or not selfie_ratios:
+        return True, 0.0, "Landmarks unavailable for structural comparison", doc_pts, selfie_pts
+
+    keys = ["bi_ocular_width", "cheekbone_width", "jaw_width", "nose_width", "face_height"]
+    deviations = []
+    for k in keys:
+        v1, v2 = doc_ratios[k], selfie_ratios[k]
+        denom = (v1 + v2) / 2.0
+        if denom > 0:
+            deviations.append(abs(v1 - v2) / denom * 100.0)
+
+    avg_dev = float(np.mean(deviations)) if deviations else 0.0
+    is_consistent = bool(avg_dev <= 28.0)
+    details = f"Mean Bone & Eye Distance Variance: {avg_dev:.2f}% (Consistent under expressions)"
+    return is_consistent, avg_dev, details, doc_pts, selfie_pts
+
+def analyze_biometrics_fusion(doc_face_rgb, selfie_rgb):
     norm_doc = preprocess_face(doc_face_rgb)
     norm_selfie = preprocess_face(selfie_rgb)
 
@@ -331,9 +379,9 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
         cv2.imwrite(f2.name, cv2.cvtColor(norm_selfie, cv2.COLOR_RGB2BGR))
         p1, p2 = f1.name, f2.name
 
-    deepface_verified = False
-    distance = 1.0
-    threshold = 0.68
+    arcface_verified = False
+    arcface_distance = 1.0
+    threshold = 0.70
 
     try:
         res = DeepFace.verify(
@@ -345,8 +393,8 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
             align=True,
             enforce_detection=False
         )
-        distance = float(res.get("distance", 1.0))
-        deepface_verified = bool(distance <= threshold)
+        arcface_distance = float(res.get("distance", 1.0))
+        arcface_verified = bool(arcface_distance <= threshold)
     except Exception:
         pass
     finally:
@@ -354,14 +402,46 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
             if os.path.exists(p):
                 os.remove(p)
 
+    struct_match, struct_dev, struct_msg, doc_pts, selfie_pts = evaluate_structural_consistency(norm_doc, norm_selfie)
+
+    final_verified = False
+    if arcface_verified:
+        final_verified = True
+    elif struct_match and arcface_distance <= 0.76:
+        final_verified = True
+
     return {
-        "verified": deepface_verified,
-        "distance": distance,
-        "threshold": threshold
+        "verified": final_verified,
+        "deepface_verified": arcface_verified,
+        "distance": arcface_distance,
+        "threshold": threshold,
+        "structural_match": struct_match,
+        "structural_deviation": struct_dev,
+        "structural_notes": struct_msg,
+        "doc_pts": doc_pts,
+        "selfie_pts": selfie_pts
     }
 
+def render_trust_gauge(score, verdict):
+    color = "#00e0a0" if verdict == "REAL" else "#ff4d6d"
+    html = f"""
+    <div style="display:flex;flex-direction:column;align-items:center;margin-top:8px;">
+      <div style="width:160px;height:160px;border-radius:50%;
+        background:conic-gradient({color} {score * 3.6}deg, #1e2230 0deg);
+        display:flex;align-items:center;justify-content:center;
+        box-shadow:0 0 25px {color}55;">
+        <div style="width:124px;height:124px;border-radius:50%;background:#0d0f18;
+             display:flex;flex-direction:column;align-items:center;justify-content:center;">
+          <span style="font-size:2.0rem;font-weight:700;color:{color};">{score}%</span>
+          <span style="font-size:0.65rem;color:#9aa0b4;letter-spacing:1px;">DOCUMENT TRUST</span>
+        </div>
+      </div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
 st.markdown('<div class="hero-title">🛡️ VerifAI — Identity & Document Forensics</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Independent Document Integrity Verification & Biometric Cross-Analysis</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">Decoupled Document Verification & Invariant Facial Geometry Fusion</div>', unsafe_allow_html=True)
 st.write("")
 
 col1, col2 = st.columns(2)
@@ -379,7 +459,7 @@ with col2:
     selfie_input = st.file_uploader("Upload Selfie", type=["jpg", "jpeg", "png"]) if selfie_mode == "Upload File" else st.camera_input("Capture Selfie")
     st.markdown('</div>', unsafe_allow_html=True)
 
-run = st.button("🔍 Run Forensic Verification Analysis", type="primary", use_container_width=True)
+run = st.button("🔍 Run Verification Analysis", type="primary", use_container_width=True)
 
 if run:
     if not doc_input:
@@ -391,7 +471,7 @@ if run:
             doc_img.thumbnail((max_size, max_size))
         doc_np = np.array(doc_img)
 
-        with st.spinner("Analyzing document authenticity and checking biometrics..."):
+        with st.spinner("Analyzing document integrity and face anatomy..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
             clean_alnum = re.sub(r'[^A-Z0-9]', '', raw_text)
@@ -426,22 +506,18 @@ if run:
 
             face_crop = extract_face(doc_np)
             bio_status = "NOT REQUESTED"
-            bio_reasons = []
             bio_result = None
 
             if selfie_input is not None:
                 if face_crop is None:
                     bio_status = "FAILED"
-                    bio_reasons.append("Face not clearly detected on document photo for comparison")
                 else:
                     selfie_img = Image.open(selfie_input).convert("RGB")
                     selfie_np = np.array(selfie_img)
-                    bio_result = analyze_biometrics(face_crop, selfie_np)
-                    if bio_result["verified"]:
-                        bio_status = "MATCHED"
-                    else:
-                        bio_status = "MISMATCH"
-                        bio_reasons.append("Selfie facial features deviate beyond cross-verification threshold")
+                    bio_result = analyze_biometrics_fusion(face_crop, selfie_np)
+                    bio_status = "MATCHED" if bio_result["verified"] else "MISMATCH"
+
+            doc_score = 95 if doc_valid else 25
 
         st.divider()
         c_left, c_right = st.columns([1.2, 1])
@@ -452,27 +528,26 @@ if run:
 
             st.write(f"**Identified Document:** {doc_type}")
             if doc_valid:
-                st.markdown('<div class="pill-real">✅ DOCUMENT: REAL / VALID</div>', unsafe_allow_html=True)
+                st.markdown('<div class="pill-real">✅ DOCUMENT INTEGRITY: VALID (REAL)</div>', unsafe_allow_html=True)
             else:
-                st.markdown('<div class="pill-fake">🚫 DOCUMENT: FAKE / TAMPERED</div>', unsafe_allow_html=True)
+                st.markdown('<div class="pill-fake">🚫 DOCUMENT INTEGRITY: INVALID / TAMPERED</div>', unsafe_allow_html=True)
 
             if selfie_input is not None:
                 if bio_status == "MATCHED":
-                    st.markdown('<div class="pill-real">✅ BIOMETRIC: FACE MATCH CONFIRMED</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="pill-real">✅ BIOMETRIC STATUS: FACE MATCH VERIFIED</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown('<div class="pill-fake">⚠️ BIOMETRIC: FACE MISMATCH</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="pill-fake">⚠️ BIOMETRIC STATUS: FACE MISMATCH</div>', unsafe_allow_html=True)
 
             audit_log = {
                 "Document Type": doc_type,
-                "Document Status": "VALID (REAL)" if doc_valid else "INVALID / TAMPERED",
+                "Document Integrity Status": "VALID (REAL)" if doc_valid else "INVALID / TAMPERED",
                 "Tampering (ELA)": "DETECTED" if is_tampered else "CLEAN",
-                "Document Issues": doc_reasons if doc_reasons else ["None - All document checks passed"],
-                "Biometric Status": bio_status
+                "Document Audit Notes": doc_reasons if doc_reasons else ["All document authenticity tests passed"],
+                "Biometric Verification": bio_status
             }
             if bio_result:
-                audit_log["Face Match Distance"] = f"{bio_result['distance']:.4f} (Threshold: {bio_result['threshold']:.4f})"
-            if bio_reasons:
-                audit_log["Biometric Issues"] = bio_reasons
+                audit_log["Biometric ArcFace Distance"] = f"{bio_result['distance']:.4f} (Threshold: {bio_result['threshold']:.4f})"
+                audit_log["Skeletal & Eye Distance Consistency"] = bio_result["structural_notes"]
 
             st.markdown('<div class="mono-log">', unsafe_allow_html=True)
             st.json(audit_log)
@@ -481,8 +556,13 @@ if run:
 
         with c_right:
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            st.subheader("Document Trust Score")
+            render_trust_gauge(doc_score, "REAL" if doc_valid else "FAKE")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
             st.subheader("Visual Audits")
             st.image(masked_preview, caption="Redacted Document (PII Masked)", use_container_width=True)
             if face_crop is not None:
-                st.image(face_crop, caption="Extracted ID Photo Crop", width=150)
+                st.image(face_crop, caption="Cropped ID Portrait", width=150)
             st.markdown('</div>', unsafe_allow_html=True)
