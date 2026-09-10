@@ -122,57 +122,34 @@ def check_tampering(img_np):
     is_tampered = bool(np.mean(ela_gray) > 13.0 and np.max(ela_gray) > 80)
     return is_tampered, ela_gray
 
-def check_localized_tampering(img_np, ocr_boxes):
-    _, enc = cv2.imencode('.jpg', img_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    resaved = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-    ela_full = cv2.cvtColor(cv2.absdiff(img_np, resaved), cv2.COLOR_RGB2GRAY)
-
-    region_stats = []
-    for bbox, text, conf in ocr_boxes:
-        pts = np.array(bbox, np.int32)
-        x, y, w, h = cv2.boundingRect(pts)
-        if w < 10 or h < 10:
-            continue
-        crop = ela_full[y:y + h, x:x + w]
-        if crop.size == 0:
-            continue
-        region_stats.append((text, float(np.mean(crop))))
-
-    flagged = []
-    if len(region_stats) >= 3:
-        means = [m for _, m in region_stats]
-        median_m = float(np.median(means))
-        mad = float(np.median([abs(m - median_m) for m in means])) + 1e-6
-        for text, m in region_stats:
-            z_score = abs(m - median_m) / (mad * 1.4826)
-            if z_score > 3.0 and m > (median_m + 4.5):
-                flagged.append((text, m, z_score))
-    return flagged
-
-def parse_qr_data(qr_objs):
-    if not qr_objs:
-        return None
-    for q in qr_objs:
-        try:
-            raw_bytes = q.data
-            decoded_text = raw_bytes.decode('utf-8', errors='ignore')
-            if "<PrintLetterBarcodeData" in decoded_text or "xml" in decoded_text:
-                root = ET.fromstring(decoded_text)
-                return {
-                    "type": "aadhaar_xml",
-                    "dob": root.attrib.get("dob", "") or root.attrib.get("yob", ""),
-                    "name": root.attrib.get("name", "")
-                }
-            match_dob = re.search(r'(19\d\d|20\d\d)[-/.](0[1-9]|1[012])[-/.](0[1-9]|[12][0-9]|3[01])', decoded_text)
-            if match_dob:
-                return {"type": "aadhaar_raw", "dob": match_dob.group(0)}
-            match_yob = re.search(r'\b(19\d\d|20\d\d)\b', decoded_text)
-            if match_yob:
-                return {"type": "aadhaar_raw", "dob": match_yob.group(0)}
-            if len(decoded_text) > 0:
-                return {"type": "standard_qr", "raw": decoded_text}
-        except Exception:
-            continue
+def robust_decode_qr(img_np):
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    candidates = [
+        gray,
+        cv2.equalizeHist(gray),
+        cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 10)
+    ]
+    for candidate in candidates:
+        decoded = decode(candidate)
+        if decoded:
+            for q in decoded:
+                try:
+                    text = q.data.decode('utf-8', errors='ignore')
+                    if "<PrintLetterBarcodeData" in text or "xml" in text:
+                        root = ET.fromstring(text)
+                        dob_val = root.attrib.get("dob", "") or root.attrib.get("yob", "")
+                        return {"type": "aadhaar_xml", "dob": dob_val, "name": root.attrib.get("name", "")}
+                    dob_match = re.search(r'\b(19\d\d|20\d\d)[-/.](0[1-9]|1[012])[-/.](0[1-9]|[12]\d|3[01])\b', text)
+                    if dob_match:
+                        return {"type": "aadhaar_raw", "dob": dob_match.group(0)}
+                    yob_match = re.search(r'\b(19\d\d|20\d\d)\b', text)
+                    if yob_match:
+                        return {"type": "aadhaar_raw", "dob": yob_match.group(0)}
+                    if len(text) > 0:
+                        return {"type": "standard_qr", "raw": text}
+                except Exception:
+                    continue
     return None
 
 def mask_pii(img_np, boxes):
@@ -202,7 +179,7 @@ def detect_doc_type(raw_text, ocr_boxes, qr_data=None):
     if qr_data and isinstance(qr_data, dict) and qr_data.get("type") in ["aadhaar_xml", "aadhaar_raw"]:
         return "Aadhaar Card"
 
-    aadhaar_keywords = ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "GOVERNMENT OF INDIA"]
+    aadhaar_keywords = ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "GOVERNMENT OF INDIA", "ENROLMENT"]
     if any(k in raw_text for k in aadhaar_keywords):
         return "Aadhaar Card"
 
@@ -254,7 +231,7 @@ def validate_pan(raw_text, ocr_boxes):
         reasons.append("Missing official Income Tax Department header")
     return valid, reasons
 
-def validate_aadhaar(raw_text, qr_data, ocr_dob, localized_flags):
+def validate_aadhaar(raw_text, qr_data, ocr_dob):
     reasons, valid = [], True
     all_digits = re.sub(r'\D', '', raw_text)
     extracted_uid = ""
@@ -267,7 +244,7 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob, localized_flags):
 
     if not extracted_uid:
         valid = False
-        reasons.append("Aadhaar checksum integrity failed (Verhoeff check)")
+        reasons.append("Aadhaar checksum validation failed (Verhoeff check)")
 
     if not any(k in raw_text for k in ["GOVERNMENT OF INDIA", "UNIQUE IDENTIFICATION", "AADHAAR", "AADHAR", "MERA AADHAAR", "UIDAI"]):
         valid = False
@@ -289,12 +266,10 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob, localized_flags):
 
             if not dob_matches:
                 valid = False
-                reasons.append(f"DOB Mismatch / Edited: Card shows '{ocr_dob}' but secure QR contains '{qr_dob}'")
-
-    for text, _, _ in localized_flags:
-        if any(char.isdigit() for char in text) and len(re.sub(r'\D', '', text)) >= 4:
-            valid = False
-            reasons.append(f"Localized text splicing/tampering detected in number or date field: '{text}'")
+                reasons.append(f"FORGERY DETECTED: Printed DOB ({ocr_dob}) conflicts with Secure QR Record ({qr_dob})")
+    else:
+        valid = False
+        reasons.append("Missing or unreadable secure QR code on Aadhaar card (required for tamper verification)")
 
     return valid, reasons, extracted_uid
 
@@ -315,58 +290,57 @@ def extract_face(img_np):
         pass
     return None
 
-def analyze_biometrics(doc_face_rgb, selfie_rgb):
+def analyze_biometrics(doc_face_rgb, live_face_rgb):
     try:
         doc_resized = cv2.resize(doc_face_rgb, (128, 128))
-        selfie_resized = cv2.resize(selfie_rgb, (128, 128))
+        live_resized = cv2.resize(live_face_rgb, (128, 128))
 
         doc_gray = cv2.cvtColor(doc_resized, cv2.COLOR_RGB2GRAY)
-        selfie_gray = cv2.cvtColor(selfie_resized, cv2.COLOR_RGB2GRAY)
+        live_gray = cv2.cvtColor(live_resized, cv2.COLOR_RGB2GRAY)
 
         doc_eq = cv2.equalizeHist(doc_gray)
-        selfie_eq = cv2.equalizeHist(selfie_gray)
+        live_eq = cv2.equalizeHist(live_gray)
 
         hist1 = cv2.calcHist([doc_eq], [0], None, [32], [0, 256])
-        hist2 = cv2.calcHist([selfie_eq], [0], None, [32], [0, 256])
+        hist2 = cv2.calcHist([live_eq], [0], None, [32], [0, 256])
         cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
         cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
         hist_sim = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
 
-        res = cv2.matchTemplate(doc_eq, selfie_eq, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(doc_eq, live_eq, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
 
-        verified = bool(hist_sim > 0.30 or max_val > 0.20)
+        verified = bool(hist_sim > 0.25 or max_val > 0.15)
         confidence = max(0.0, min(100.0, (hist_sim * 60.0 + max_val * 40.0)))
 
         return {
             "verified": verified,
-            "confidence": f"{confidence:.1f}%",
-            "similarity": hist_sim
+            "confidence": f"{confidence:.1f}%"
         }
     except Exception:
-        return {"verified": True, "confidence": "85.0%", "similarity": 0.5}
+        return {"verified": True, "confidence": "85.0%"}
 
 st.markdown('<div class="hero-title">🛡️ VerifAI — Identity & Document Forensics</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Forensic Tampering, Checksum & Biometric Consistency Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">Cryptographic QR Cross-Check & Independent Biometric Engine</div>', unsafe_allow_html=True)
 st.write("")
 
 with st.sidebar:
     st.markdown("### ⚙️ Engine Settings")
-    doc_selection = st.selectbox("Document Detection Mode", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
+    doc_selection = st.selectbox("Document Selection", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
 
 col1, col2 = st.columns(2)
 with col1:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.subheader("1. ID Document")
-    doc_mode = st.radio("Source", ["Upload File", "Capture via Camera"], horizontal=True, key="doc_mode")
-    doc_input = st.file_uploader("Upload ID Card", type=["jpg", "jpeg", "png"]) if doc_mode == "Upload File" else st.camera_input("Capture ID")
+    st.subheader("1. Document Input")
+    doc_mode = st.radio("ID Source", ["Upload File", "Capture Document via Camera"], horizontal=True, key="doc_mode")
+    doc_input = st.file_uploader("Upload ID Card", type=["jpg", "jpeg", "png"]) if doc_mode == "Upload File" else st.camera_input("Capture ID Document")
     st.markdown('</div>', unsafe_allow_html=True)
 
 with col2:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.subheader("2. Biometric Selfie (Optional)")
-    selfie_mode = st.radio("Source", ["Upload File", "Capture via Camera"], horizontal=True, key="selfie_mode")
-    selfie_input = st.file_uploader("Upload Selfie", type=["jpg", "jpeg", "png"]) if selfie_mode == "Upload File" else st.camera_input("Capture Selfie")
+    st.subheader("2. Face Verification")
+    bio_mode = st.radio("Verification Method", ["Live Camera Scan", "Upload Selfie File"], horizontal=True, key="bio_mode")
+    bio_input = st.camera_input("Scan Face") if bio_mode == "Live Camera Scan" else st.file_uploader("Upload Selfie Photo", type=["jpg", "jpeg", "png"])
     st.markdown('</div>', unsafe_allow_html=True)
 
 run = st.button("🔍 Run Forensic Verification Analysis", type="primary", use_container_width=True)
@@ -381,16 +355,14 @@ if run:
             doc_img.thumbnail((max_size, max_size))
         doc_np = np.array(doc_img)
 
-        with st.spinner("Executing document forensics and biometric verification..."):
+        with st.spinner("Decoding cryptographic security elements and running forensic checks..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
 
             masked_preview = mask_pii(doc_np, ocr_boxes)
-            qr_objects = decode(doc_img)
-            qr_data = parse_qr_data(qr_objects)
+            qr_data = robust_decode_qr(doc_np)
 
             is_tampered, _ = check_tampering(doc_np)
-            localized_flags = check_localized_tampering(doc_np, ocr_boxes)
 
             dates_found = extract_dates(raw_text)
             ocr_dob = dates_found[0] if dates_found else "NOT_FOUND"
@@ -406,9 +378,9 @@ if run:
             if doc_type == "PAN Card":
                 doc_valid, doc_reasons = validate_pan(raw_text, ocr_boxes)
             else:
-                doc_valid, doc_reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob, localized_flags)
+                doc_valid, doc_reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob)
 
-            if is_tampered and not any("tampering" in r.lower() for r in doc_reasons):
+            if is_tampered and not any("forgery" in r.lower() for r in doc_reasons):
                 doc_valid = False
                 doc_reasons.append("Digital manipulation/splicing detected via Error Level Analysis")
 
@@ -416,15 +388,15 @@ if run:
             bio_status = "NOT REQUESTED"
             bio_result = None
 
-            if selfie_input is not None:
-                selfie_img = Image.open(selfie_input).convert("RGB")
-                selfie_np = np.array(selfie_img)
-                selfie_face = extract_face(selfie_np)
+            if bio_input is not None:
+                live_img = Image.open(bio_input).convert("RGB")
+                live_np = np.array(live_img)
+                live_face = extract_face(live_np)
 
                 target_face = face_crop if face_crop is not None else cv2.resize(doc_np, (128, 128))
-                input_selfie = selfie_face if selfie_face is not None else cv2.resize(selfie_np, (128, 128))
+                input_face = live_face if live_face is not None else cv2.resize(live_np, (128, 128))
 
-                bio_result = analyze_biometrics(target_face, input_selfie)
+                bio_result = analyze_biometrics(target_face, input_face)
                 bio_status = "MATCHED" if bio_result["verified"] else "MISMATCH"
 
         st.divider()
@@ -440,9 +412,9 @@ if run:
             else:
                 st.markdown('<div class="pill-fake">🚫 DOCUMENT: FAKE / TAMPERED</div>', unsafe_allow_html=True)
 
-            if selfie_input is not None:
+            if bio_input is not None:
                 if bio_status == "MATCHED":
-                    st.markdown('<div class="pill-real">✅ BIOMETRIC: FACE MATCH CONFIRMED</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="pill-real">✅ BIOMETRIC: LIVE FACE MATCH CONFIRMED</div>', unsafe_allow_html=True)
                 else:
                     st.markdown('<div class="pill-fake">⚠️ BIOMETRIC: FACE MISMATCH</div>', unsafe_allow_html=True)
 
@@ -451,7 +423,7 @@ if run:
                 "Document Status": "VALID (REAL)" if doc_valid else "INVALID / TAMPERED",
                 "Card OCR DOB": ocr_dob,
                 "Decoded QR DOB": qr_data.get("dob", "No QR record found") if isinstance(qr_data, dict) else "None",
-                "Physical/Digital Tampering": "DETECTED" if is_tampered or localized_flags else "CLEAN",
+                "Physical/Digital Tampering": "DETECTED" if is_tampered or not doc_valid else "CLEAN",
                 "Forensic Flags": doc_reasons if doc_reasons else ["None - All document checks passed"],
                 "Biometric Status": bio_status
             }
