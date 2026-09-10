@@ -7,7 +7,6 @@ import xml.etree.ElementTree as ET
 from PIL import Image
 from pyzbar.pyzbar import decode
 from deepface import DeepFace
-import mediapipe as mp
 import tempfile
 import os
 
@@ -83,7 +82,6 @@ def load_ocr():
     return easyocr.Reader(['en'], gpu=False, model_storage_directory="./models", download_enabled=True)
 
 reader = load_ocr()
-mp_face_mesh = mp.solutions.face_mesh
 
 d_table = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
@@ -122,35 +120,8 @@ def check_tampering(img_np):
     resaved = cv2.imdecode(enc, cv2.IMREAD_COLOR)
     ela = cv2.absdiff(img_np, resaved)
     ela_gray = cv2.cvtColor(ela, cv2.COLOR_RGB2GRAY)
-    is_tampered = bool(np.mean(ela_gray) > 13.5 and np.max(ela_gray) > 85)
+    is_tampered = bool(np.mean(ela_gray) > 16.0 and np.max(ela_gray) > 110)
     return is_tampered, ela_gray
-
-def check_localized_tampering(img_np, ocr_boxes):
-    _, enc = cv2.imencode('.jpg', img_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    resaved = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-    ela_full = cv2.cvtColor(cv2.absdiff(img_np, resaved), cv2.COLOR_RGB2GRAY)
-
-    region_stats = []
-    for bbox, text, conf in ocr_boxes:
-        pts = np.array(bbox, np.int32)
-        x, y, w, h = cv2.boundingRect(pts)
-        if w < 10 or h < 10:
-            continue
-        crop = ela_full[y:y + h, x:x + w]
-        if crop.size == 0:
-            continue
-        region_stats.append((text, float(np.mean(crop))))
-
-    flagged = []
-    if len(region_stats) >= 3:
-        means = [m for _, m in region_stats]
-        median_m = float(np.median(means))
-        mad = float(np.median([abs(m - median_m) for m in means])) + 1e-6
-        for text, m in region_stats:
-            z_score = abs(m - median_m) / (mad * 1.4826)
-            if z_score > 3.2 and m > (median_m + 5.0):
-                flagged.append((text, m, z_score))
-    return flagged
 
 def parse_qr_data(qr_objs):
     if not qr_objs:
@@ -175,7 +146,7 @@ def parse_qr_data(qr_objs):
 
 def mask_pii(img_np, boxes):
     masked = img_np.copy()
-    pan_regex = r'[A-Z]{5}[0-9]{4}[A-Z]{1}'
+    pan_regex = r'\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b'
     for (bbox, text, _) in boxes:
         clean_digits = re.sub(r'\D', '', text)
         clean_text = text.replace(" ", "").upper()
@@ -196,39 +167,59 @@ def extract_dates(text):
             dates.append(m.group(0))
     return dates
 
-def detect_doc_type(raw_text, clean_alnum, qr_data=None):
-    pan_matches = re.findall(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', clean_alnum)
-    pan_keywords = ["INCOME TAX", "PERMANENT ACCOUNT", "INCOMETAX", "FATHER'S NAME", "GOVT. OF INDIA", "SIGNATURE"]
-    has_pan_kw = any(k in raw_text for k in pan_keywords)
-
-    if pan_matches or (has_pan_kw and not any(k in raw_text for k in ["AADHAAR", "UIDAI"])):
-        return "PAN Card"
-
+def detect_doc_type(raw_text, ocr_boxes, qr_data=None):
     if qr_data and isinstance(qr_data, dict) and qr_data.get("type") == "aadhaar_xml":
         return "Aadhaar Card"
 
-    aadhaar_keywords = ["AADHAAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "GOVERNMENT OF INDIA"]
+    aadhaar_keywords = ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "ENROLMENT", "HELP@UIDAI"]
     has_aadhaar_kw = any(k in raw_text for k in aadhaar_keywords)
 
-    all_digits = re.findall(r'\b\d{4}\s?\d{4}\s?\d{4}\b', raw_text)
-    if not all_digits:
-        digits_only = re.sub(r'\D', '', raw_text)
-        for i in range(max(len(digits_only) - 11, 0)):
-            seq = digits_only[i:i + 12]
-            if len(seq) == 12 and seq[0] not in '01' and validate_verhoeff(seq):
-                all_digits.append(seq)
-                break
+    all_digits = re.sub(r'\D', '', raw_text)
+    has_valid_aadhaar_checksum = False
+    for i in range(max(len(all_digits) - 11, 0)):
+        seq = all_digits[i:i + 12]
+        if len(seq) == 12 and seq[0] not in '01' and validate_verhoeff(seq):
+            has_valid_aadhaar_checksum = True
+            break
 
-    if has_aadhaar_kw or all_digits:
+    if has_aadhaar_kw or has_valid_aadhaar_checksum:
         return "Aadhaar Card"
+
+    pan_keywords = ["INCOME TAX", "PERMANENT ACCOUNT", "INCOMETAX", "GOVT. OF INDIA"]
+    has_pan_kw = any(k in raw_text for k in pan_keywords)
+
+    has_valid_pan_format = False
+    for _, text, _ in ocr_boxes:
+        words = re.findall(r'\b[A-Z0-9]{10}\b', text.upper().replace(" ", ""))
+        for w in words:
+            if re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', w):
+                if w[3] in "PCHFATBLJG":
+                    has_valid_pan_format = True
+                    break
+
+    if has_pan_kw and has_valid_pan_format:
+        return "PAN Card"
+
+    if has_pan_kw:
+        return "PAN Card"
+    if has_valid_pan_format:
+        return "PAN Card"
 
     return "Unrecognized"
 
-def validate_pan(raw_text, clean_alnum):
+def validate_pan(raw_text, ocr_boxes):
     reasons, valid = [], True
-    pan_hits = re.findall(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', clean_alnum)
-    if pan_hits:
-        pan_val = pan_hits[0]
+    pan_val = None
+    for _, text, _ in ocr_boxes:
+        words = re.findall(r'\b[A-Z0-9]{10}\b', text.upper().replace(" ", ""))
+        for w in words:
+            if re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', w):
+                pan_val = w
+                break
+        if pan_val:
+            break
+
+    if pan_val:
         if pan_val[3] not in "PCHFATBLJG":
             valid = False
             reasons.append(f"Invalid 4th character status code on PAN: '{pan_val[3]}'")
@@ -256,7 +247,7 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob):
         valid = False
         reasons.append("Aadhaar checksum integrity failed (Verhoeff check)")
 
-    if not any(k in raw_text for k in ["GOVERNMENT OF INDIA", "UNIQUE IDENTIFICATION", "AADHAAR", "MERA AADHAAR", "UIDAI"]):
+    if not any(k in raw_text for k in ["GOVERNMENT OF INDIA", "UNIQUE IDENTIFICATION", "AADHAAR", "AADHAR", "MERA AADHAAR", "UIDAI"]):
         valid = False
         reasons.append("Missing official Government of India / UIDAI header")
 
@@ -312,64 +303,7 @@ def extract_face(img_np):
         pass
     return None
 
-LANDMARK_INDICES = {
-    "left_eye_outer": 33, "right_eye_outer": 263,
-    "left_eye_inner": 133, "right_eye_inner": 362,
-    "left_cheek": 234, "right_cheek": 454,
-    "nose_left": 98, "nose_right": 327,
-    "jaw_left": 172, "jaw_right": 397,
-    "chin": 152, "forehead": 10
-}
-
-def extract_structural_ratios(face_rgb):
-    if face_rgb is None or face_rgb.size == 0:
-        return None, None
-    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.3) as fm:
-        results = fm.process(face_rgb)
-        if not results.multi_face_landmarks:
-            return None, None
-        lm = results.multi_face_landmarks[0].landmark
-        h, w, _ = face_rgb.shape
-        pts = {k: np.array([lm[idx].x * w, lm[idx].y * h]) for k, idx in LANDMARK_INDICES.items()}
-
-        def dist(a, b):
-            return float(np.linalg.norm(pts[a] - pts[b]))
-
-        inter_ocular = dist("left_eye_inner", "right_eye_inner")
-        if inter_ocular < 1e-3:
-            return None, None
-
-        ratios = {
-            "eye_spacing": inter_ocular,
-            "bi_ocular_width": dist("left_eye_outer", "right_eye_outer") / inter_ocular,
-            "cheekbone_width": dist("left_cheek", "right_cheek") / inter_ocular,
-            "jaw_width": dist("jaw_left", "jaw_right") / inter_ocular,
-            "nose_width": dist("nose_left", "nose_right") / inter_ocular,
-            "face_height": dist("forehead", "chin") / inter_ocular
-        }
-        return ratios, pts
-
-def evaluate_structural_consistency(doc_face, selfie_face):
-    doc_ratios, doc_pts = extract_structural_ratios(doc_face)
-    selfie_ratios, selfie_pts = extract_structural_ratios(selfie_face)
-
-    if not doc_ratios or not selfie_ratios:
-        return True, 0.0, "Landmarks unavailable for structural comparison", doc_pts, selfie_pts
-
-    keys = ["bi_ocular_width", "cheekbone_width", "jaw_width", "nose_width", "face_height"]
-    deviations = []
-    for k in keys:
-        v1, v2 = doc_ratios[k], selfie_ratios[k]
-        denom = (v1 + v2) / 2.0
-        if denom > 0:
-            deviations.append(abs(v1 - v2) / denom * 100.0)
-
-    avg_dev = float(np.mean(deviations)) if deviations else 0.0
-    is_consistent = bool(avg_dev <= 28.0)
-    details = f"Mean Bone & Eye Distance Variance: {avg_dev:.2f}% (Consistent under expressions)"
-    return is_consistent, avg_dev, details, doc_pts, selfie_pts
-
-def analyze_biometrics_fusion(doc_face_rgb, selfie_rgb):
+def analyze_biometrics(doc_face_rgb, selfie_rgb):
     norm_doc = preprocess_face(doc_face_rgb)
     norm_selfie = preprocess_face(selfie_rgb)
 
@@ -379,12 +313,11 @@ def analyze_biometrics_fusion(doc_face_rgb, selfie_rgb):
         cv2.imwrite(f2.name, cv2.cvtColor(norm_selfie, cv2.COLOR_RGB2BGR))
         p1, p2 = f1.name, f2.name
 
-    arcface_verified = False
-    arcface_distance = 1.0
-    threshold = 0.70
+    arc_dist = 1.0
+    vgg_dist = 1.0
 
     try:
-        res = DeepFace.verify(
+        res_arc = DeepFace.verify(
             img1_path=p1,
             img2_path=p2,
             model_name="ArcFace",
@@ -393,8 +326,21 @@ def analyze_biometrics_fusion(doc_face_rgb, selfie_rgb):
             align=True,
             enforce_detection=False
         )
-        arcface_distance = float(res.get("distance", 1.0))
-        arcface_verified = bool(arcface_distance <= threshold)
+        arc_dist = float(res_arc.get("distance", 1.0))
+    except Exception:
+        pass
+
+    try:
+        res_vgg = DeepFace.verify(
+            img1_path=p1,
+            img2_path=p2,
+            model_name="VGG-Face",
+            detector_backend="opencv",
+            distance_metric="cosine",
+            align=True,
+            enforce_detection=False
+        )
+        vgg_dist = float(res_vgg.get("distance", 1.0))
     except Exception:
         pass
     finally:
@@ -402,47 +348,21 @@ def analyze_biometrics_fusion(doc_face_rgb, selfie_rgb):
             if os.path.exists(p):
                 os.remove(p)
 
-    struct_match, struct_dev, struct_msg, doc_pts, selfie_pts = evaluate_structural_consistency(norm_doc, norm_selfie)
-
-    final_verified = False
-    if arcface_verified:
-        final_verified = True
-    elif struct_match and arcface_distance <= 0.76:
-        final_verified = True
+    verified = bool((arc_dist <= 0.78) or (vgg_dist <= 0.48))
 
     return {
-        "verified": final_verified,
-        "deepface_verified": arcface_verified,
-        "distance": arcface_distance,
-        "threshold": threshold,
-        "structural_match": struct_match,
-        "structural_deviation": struct_dev,
-        "structural_notes": struct_msg,
-        "doc_pts": doc_pts,
-        "selfie_pts": selfie_pts
+        "verified": verified,
+        "arcface_distance": arc_dist,
+        "vgg_distance": vgg_dist
     }
 
-def render_trust_gauge(score, verdict):
-    color = "#00e0a0" if verdict == "REAL" else "#ff4d6d"
-    html = f"""
-    <div style="display:flex;flex-direction:column;align-items:center;margin-top:8px;">
-      <div style="width:160px;height:160px;border-radius:50%;
-        background:conic-gradient({color} {score * 3.6}deg, #1e2230 0deg);
-        display:flex;align-items:center;justify-content:center;
-        box-shadow:0 0 25px {color}55;">
-        <div style="width:124px;height:124px;border-radius:50%;background:#0d0f18;
-             display:flex;flex-direction:column;align-items:center;justify-content:center;">
-          <span style="font-size:2.0rem;font-weight:700;color:{color};">{score}%</span>
-          <span style="font-size:0.65rem;color:#9aa0b4;letter-spacing:1px;">DOCUMENT TRUST</span>
-        </div>
-      </div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
 st.markdown('<div class="hero-title">🛡️ VerifAI — Identity & Document Forensics</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Decoupled Document Verification & Invariant Facial Geometry Fusion</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">Decoupled Document Verification & Biometric Cross-Analysis</div>', unsafe_allow_html=True)
 st.write("")
+
+with st.sidebar:
+    st.markdown("### ⚙️ Detection Settings")
+    override_type = st.selectbox("Document Selection", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
 
 col1, col2 = st.columns(2)
 with col1:
@@ -459,7 +379,7 @@ with col2:
     selfie_input = st.file_uploader("Upload Selfie", type=["jpg", "jpeg", "png"]) if selfie_mode == "Upload File" else st.camera_input("Capture Selfie")
     st.markdown('</div>', unsafe_allow_html=True)
 
-run = st.button("🔍 Run Verification Analysis", type="primary", use_container_width=True)
+run = st.button("🔍 Run Forensic Verification Analysis", type="primary", use_container_width=True)
 
 if run:
     if not doc_input:
@@ -471,29 +391,29 @@ if run:
             doc_img.thumbnail((max_size, max_size))
         doc_np = np.array(doc_img)
 
-        with st.spinner("Analyzing document integrity and face anatomy..."):
+        with st.spinner("Analyzing document authenticity and checking biometrics..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
-            clean_alnum = re.sub(r'[^A-Z0-9]', '', raw_text)
 
             masked_preview = mask_pii(doc_np, ocr_boxes)
             qr_objects = decode(doc_img)
             qr_data = parse_qr_data(qr_objects)
 
             is_tampered, _ = check_tampering(doc_np)
-            localized_flags = check_localized_tampering(doc_np, ocr_boxes)
-            if localized_flags:
-                is_tampered = True
 
             dates_found = extract_dates(raw_text)
             ocr_dob = dates_found[0] if dates_found else "NOT_FOUND"
 
-            doc_type = detect_doc_type(raw_text, clean_alnum, qr_data)
+            if override_type != "Auto-Detect":
+                doc_type = override_type
+            else:
+                doc_type = detect_doc_type(raw_text, ocr_boxes, qr_data)
+
             doc_reasons = []
             doc_valid = True
 
             if doc_type == "PAN Card":
-                doc_valid, doc_reasons = validate_pan(raw_text, clean_alnum)
+                doc_valid, doc_reasons = validate_pan(raw_text, ocr_boxes)
             elif doc_type == "Aadhaar Card":
                 doc_valid, doc_reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob)
             else:
@@ -511,13 +431,12 @@ if run:
             if selfie_input is not None:
                 if face_crop is None:
                     bio_status = "FAILED"
+                    doc_reasons.append("Face not clearly detected on document photo for comparison")
                 else:
                     selfie_img = Image.open(selfie_input).convert("RGB")
                     selfie_np = np.array(selfie_img)
-                    bio_result = analyze_biometrics_fusion(face_crop, selfie_np)
+                    bio_result = analyze_biometrics(face_crop, selfie_np)
                     bio_status = "MATCHED" if bio_result["verified"] else "MISMATCH"
-
-            doc_score = 95 if doc_valid else 25
 
         st.divider()
         c_left, c_right = st.columns([1.2, 1])
@@ -528,26 +447,26 @@ if run:
 
             st.write(f"**Identified Document:** {doc_type}")
             if doc_valid:
-                st.markdown('<div class="pill-real">✅ DOCUMENT INTEGRITY: VALID (REAL)</div>', unsafe_allow_html=True)
+                st.markdown('<div class="pill-real">✅ DOCUMENT: REAL / VALID</div>', unsafe_allow_html=True)
             else:
-                st.markdown('<div class="pill-fake">🚫 DOCUMENT INTEGRITY: INVALID / TAMPERED</div>', unsafe_allow_html=True)
+                st.markdown('<div class="pill-fake">🚫 DOCUMENT: FAKE / TAMPERED</div>', unsafe_allow_html=True)
 
             if selfie_input is not None:
                 if bio_status == "MATCHED":
-                    st.markdown('<div class="pill-real">✅ BIOMETRIC STATUS: FACE MATCH VERIFIED</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="pill-real">✅ BIOMETRIC: FACE MATCH CONFIRMED</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown('<div class="pill-fake">⚠️ BIOMETRIC STATUS: FACE MISMATCH</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="pill-fake">⚠️ BIOMETRIC: FACE MISMATCH</div>', unsafe_allow_html=True)
 
             audit_log = {
                 "Document Type": doc_type,
-                "Document Integrity Status": "VALID (REAL)" if doc_valid else "INVALID / TAMPERED",
+                "Document Status": "VALID (REAL)" if doc_valid else "INVALID / TAMPERED",
                 "Tampering (ELA)": "DETECTED" if is_tampered else "CLEAN",
-                "Document Audit Notes": doc_reasons if doc_reasons else ["All document authenticity tests passed"],
-                "Biometric Verification": bio_status
+                "Document Issues": doc_reasons if doc_reasons else ["None - All document checks passed"],
+                "Biometric Status": bio_status
             }
             if bio_result:
-                audit_log["Biometric ArcFace Distance"] = f"{bio_result['distance']:.4f} (Threshold: {bio_result['threshold']:.4f})"
-                audit_log["Skeletal & Eye Distance Consistency"] = bio_result["structural_notes"]
+                audit_log["ArcFace Distance"] = f"{bio_result['arcface_distance']:.4f} (Threshold: 0.78)"
+                audit_log["VGG-Face Distance"] = f"{bio_result['vgg_distance']:.4f} (Threshold: 0.48)"
 
             st.markdown('<div class="mono-log">', unsafe_allow_html=True)
             st.json(audit_log)
@@ -556,13 +475,8 @@ if run:
 
         with c_right:
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.subheader("Document Trust Score")
-            render_trust_gauge(doc_score, "REAL" if doc_valid else "FAKE")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
             st.subheader("Visual Audits")
             st.image(masked_preview, caption="Redacted Document (PII Masked)", use_container_width=True)
             if face_crop is not None:
-                st.image(face_crop, caption="Cropped ID Portrait", width=150)
+                st.image(face_crop, caption="Extracted ID Photo Crop", width=150)
             st.markdown('</div>', unsafe_allow_html=True)
