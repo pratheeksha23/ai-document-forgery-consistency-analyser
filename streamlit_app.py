@@ -9,7 +9,7 @@ from pyzbar.pyzbar import decode
 import tempfile
 import os
 
-st.set_page_config(page_title="VerifAI | Identity Forensics", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="VerifAI | Multi-ID Forensics Engine", page_icon="🛡️", layout="wide")
 
 CUSTOM_CSS = """
 <style>
@@ -175,50 +175,64 @@ def extract_dates(text):
             dates.append(m.group(0))
     return dates
 
-def detect_doc_type(raw_text, ocr_boxes, qr_data=None):
-    if qr_data and isinstance(qr_data, dict) and qr_data.get("type") in ["aadhaar_xml", "aadhaar_raw"]:
-        return "Aadhaar Card"
+def classify_document(raw_text, clean_alnum, qr_data=None):
+    scores = {
+        "PAN Card": 0,
+        "Aadhaar Card": 0,
+        "Driving Licence": 0,
+        "Voter ID": 0
+    }
 
-    aadhaar_keywords = ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "GOVERNMENT OF INDIA", "ENROLMENT"]
-    if any(k in raw_text for k in aadhaar_keywords):
-        return "Aadhaar Card"
+    # Aadhaar checks
+    if qr_data and isinstance(qr_data, dict) and qr_data.get("type") in ["aadhaar_xml", "aadhaar_raw"]:
+        scores["Aadhaar Card"] += 15
+    for kw in ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "ENROLMENT"]:
+        if kw in raw_text:
+            scores["Aadhaar Card"] += 5
 
     all_digits = re.sub(r'\D', '', raw_text)
     for i in range(max(len(all_digits) - 11, 0)):
         seq = all_digits[i:i + 12]
         if len(seq) == 12 and seq[0] not in '01' and validate_verhoeff(seq):
-            return "Aadhaar Card"
-
-    pan_keywords = ["INCOME TAX", "PERMANENT ACCOUNT", "INCOMETAX"]
-    has_pan_kw = any(k in raw_text for k in pan_keywords)
-
-    has_valid_pan_format = False
-    for _, text, _ in ocr_boxes:
-        words = re.findall(r'\b[A-Z0-9]{10}\b', text.upper().replace(" ", ""))
-        for w in words:
-            if re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', w):
-                if w[3] in "PCHFATBLJG":
-                    has_valid_pan_format = True
-                    break
-
-    if has_pan_kw or has_valid_pan_format:
-        return "PAN Card"
-
-    return "Aadhaar Card"
-
-def validate_pan(raw_text, ocr_boxes):
-    reasons, valid = [], True
-    pan_val = None
-    for _, text, _ in ocr_boxes:
-        words = re.findall(r'\b[A-Z0-9]{10}\b', text.upper().replace(" ", ""))
-        for w in words:
-            if re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', w):
-                pan_val = w
-                break
-        if pan_val:
+            scores["Aadhaar Card"] += 10
             break
 
-    if pan_val:
+    # PAN checks
+    pan_matches = re.findall(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', clean_alnum)
+    if pan_matches:
+        scores["PAN Card"] += 10
+        if pan_matches[0][3] in "PCHFATBLJG":
+            scores["PAN Card"] += 5
+    for kw in ["INCOME TAX", "PERMANENT ACCOUNT", "INCOMETAX", "GOVT. OF INDIA", "FATHER'S NAME"]:
+        if kw in raw_text:
+            scores["PAN Card"] += 4
+
+    # Driving Licence checks
+    dl_matches = re.findall(r'[A-Z]{2}[0-9]{2}[0-9]{9,11}', clean_alnum)
+    if dl_matches:
+        scores["Driving Licence"] += 10
+    for kw in ["DRIVING LICENCE", "DRIVING LICENSE", "UNION OF INDIA DRIVING", "MOTOR VEHICLES", "TRANSPORT DEPARTMENT", "LMV", "MCWG"]:
+        if kw in raw_text:
+            scores["Driving Licence"] += 5
+
+    # Voter ID checks
+    voter_matches = re.findall(r'[A-Z]{3}[0-9]{7}', clean_alnum)
+    if voter_matches:
+        scores["Voter ID"] += 10
+    for kw in ["ELECTION COMMISSION", "ELECTORAL", "ELECTOR", "IDENTITY CARD", "EPIC"]:
+        if kw in raw_text:
+            scores["Voter ID"] += 5
+
+    best_type = max(scores, key=scores.get)
+    if scores[best_type] < 4:
+        return "Unrecognized"
+    return best_type
+
+def validate_pan(raw_text, clean_alnum):
+    reasons, valid = [], True
+    pan_hits = re.findall(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', clean_alnum)
+    if pan_hits:
+        pan_val = pan_hits[0]
         if pan_val[3] not in "PCHFATBLJG":
             valid = False
             reasons.append(f"Invalid 4th character status code on PAN: '{pan_val[3]}'")
@@ -228,7 +242,7 @@ def validate_pan(raw_text, ocr_boxes):
 
     if not any(k in raw_text for k in ["INCOME", "TAX", "GOVT", "INDIA", "ACCOUNT"]):
         valid = False
-        reasons.append("Missing official Income Tax Department header")
+        reasons.append("Missing Income Tax Department validation header")
     return valid, reasons
 
 def validate_aadhaar(raw_text, qr_data, ocr_dob):
@@ -269,9 +283,31 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob):
                 reasons.append(f"FORGERY DETECTED: Printed DOB ({ocr_dob}) conflicts with Secure QR Record ({qr_dob})")
     else:
         valid = False
-        reasons.append("Missing or unreadable secure QR code on Aadhaar card (required for tamper verification)")
+        reasons.append("Secure QR code unreadable (required to confirm printed DOB against records)")
 
-    return valid, reasons, extracted_uid
+    return valid, reasons
+
+def validate_driving_licence(raw_text, clean_alnum):
+    reasons, valid = [], True
+    dl_hits = re.findall(r'[A-Z]{2}[0-9]{2}[0-9]{9,11}', clean_alnum)
+    if not dl_hits:
+        valid = False
+        reasons.append("Standard DL numbering pattern (State+RTO+Serial) not detected")
+    if not any(k in raw_text for k in ["DRIVING LICENCE", "DRIVING LICENSE", "TRANSPORT", "UNION OF INDIA"]):
+        valid = False
+        reasons.append("Missing Transport Department validation header")
+    return valid, reasons
+
+def validate_voter_id(raw_text, clean_alnum):
+    reasons, valid = [], True
+    epic_hits = re.findall(r'[A-Z]{3}[0-9]{7}', clean_alnum)
+    if not epic_hits:
+        valid = False
+        reasons.append("Valid 10-character EPIC format not detected")
+    if not any(k in raw_text for k in ["ELECTION COMMISSION", "ELECTOR", "INDIA"]):
+        valid = False
+        reasons.append("Missing Election Commission of India header")
+    return valid, reasons
 
 def extract_face(img_np):
     try:
@@ -320,19 +356,19 @@ def analyze_biometrics(doc_face_rgb, live_face_rgb):
     except Exception:
         return {"verified": True, "confidence": "85.0%"}
 
-st.markdown('<div class="hero-title">🛡️ VerifAI — Identity & Document Forensics</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Cryptographic QR Cross-Check & Independent Biometric Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-title">🛡️ VerifAI — Multi-ID Forensics Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">PAN · Aadhaar · Driving Licence · Voter ID Detection & Cryptographic Cross-Check</div>', unsafe_allow_html=True)
 st.write("")
 
 with st.sidebar:
     st.markdown("### ⚙️ Engine Settings")
-    doc_selection = st.selectbox("Document Selection", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
+    doc_selection = st.selectbox("Document Detection Mode", ["Auto-Detect", "PAN Card", "Aadhaar Card", "Driving Licence", "Voter ID"])
 
 col1, col2 = st.columns(2)
 with col1:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.subheader("1. Document Input")
-    doc_mode = st.radio("ID Source", ["Upload File", "Capture Document via Camera"], horizontal=True, key="doc_mode")
+    doc_mode = st.radio("ID Source", ["Upload File", "Capture via Camera"], horizontal=True, key="doc_mode")
     doc_input = st.file_uploader("Upload ID Card", type=["jpg", "jpeg", "png"]) if doc_mode == "Upload File" else st.camera_input("Capture ID Document")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -355,9 +391,10 @@ if run:
             doc_img.thumbnail((max_size, max_size))
         doc_np = np.array(doc_img)
 
-        with st.spinner("Decoding cryptographic security elements and running forensic checks..."):
+        with st.spinner("Analyzing document classification and running forensic checks..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
+            clean_alnum = re.sub(r'[^A-Z0-9]', '', raw_text)
 
             masked_preview = mask_pii(doc_np, ocr_boxes)
             qr_data = robust_decode_qr(doc_np)
@@ -370,15 +407,22 @@ if run:
             if doc_selection != "Auto-Detect":
                 doc_type = doc_selection
             else:
-                doc_type = detect_doc_type(raw_text, ocr_boxes, qr_data)
+                doc_type = classify_document(raw_text, clean_alnum, qr_data)
 
             doc_reasons = []
             doc_valid = True
 
             if doc_type == "PAN Card":
-                doc_valid, doc_reasons = validate_pan(raw_text, ocr_boxes)
+                doc_valid, doc_reasons = validate_pan(raw_text, clean_alnum)
+            elif doc_type == "Aadhaar Card":
+                doc_valid, doc_reasons = validate_aadhaar(raw_text, qr_data, ocr_dob)
+            elif doc_type == "Driving Licence":
+                doc_valid, doc_reasons = validate_driving_licence(raw_text, clean_alnum)
+            elif doc_type == "Voter ID":
+                doc_valid, doc_reasons = validate_voter_id(raw_text, clean_alnum)
             else:
-                doc_valid, doc_reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob)
+                doc_valid = False
+                doc_reasons.append("Document could not be recognized as a valid government ID")
 
             if is_tampered and not any("forgery" in r.lower() for r in doc_reasons):
                 doc_valid = False
