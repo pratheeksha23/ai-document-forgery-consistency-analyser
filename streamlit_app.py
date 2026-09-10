@@ -277,26 +277,25 @@ def preprocess_face(face_rgb):
     return cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
 
 def extract_face(img_np):
-    for detector in ['retinaface', 'opencv']:
-        try:
-            faces = DeepFace.extract_faces(
-                img_np, 
-                detector_backend=detector, 
-                align=True, 
-                enforce_detection=False
-            )
-            if faces and len(faces) > 0:
-                fa = faces[0]['facial_area']
-                x, y, w, h = fa['x'], fa['y'], fa['w'], fa['h']
-                H, W, _ = img_np.shape
-                pad = int(min(w, h) * 0.15)
-                x0, y0 = max(x - pad, 0), max(y - pad, 0)
-                x1, y1 = min(x + w + pad, W), min(y + h + pad, H)
-                cropped = img_np[y0:y1, x0:x1]
-                if cropped.size > 0:
-                    return preprocess_face(cropped)
-        except Exception:
-            continue
+    try:
+        faces = DeepFace.extract_faces(
+            img_np, 
+            detector_backend='opencv', 
+            align=True, 
+            enforce_detection=False
+        )
+        if faces and len(faces) > 0:
+            fa = faces[0]['facial_area']
+            x, y, w, h = fa['x'], fa['y'], fa['w'], fa['h']
+            H, W, _ = img_np.shape
+            pad = int(min(w, h) * 0.15)
+            x0, y0 = max(x - pad, 0), max(y - pad, 0)
+            x1, y1 = min(x + w + pad, W), min(y + h + pad, H)
+            cropped = img_np[y0:y1, x0:x1]
+            if cropped.size > 0:
+                return preprocess_face(cropped)
+    except Exception:
+        pass
     return None
 
 def analyze_biometrics(doc_face_rgb, selfie_rgb):
@@ -309,34 +308,20 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
         cv2.imwrite(f2.name, cv2.cvtColor(norm_selfie, cv2.COLOR_RGB2BGR))
         p1, p2 = f1.name, f2.name
 
-    arc_dist = 1.0
-    vgg_dist = 1.0
+    distance = 1.0
+    threshold = 0.55
 
     try:
-        res_arc = DeepFace.verify(
+        res = DeepFace.verify(
             img1_path=p1,
             img2_path=p2,
-            model_name="ArcFace",
-            detector_backend="retinaface",
+            model_name="Facenet512",
+            detector_backend="opencv",
             distance_metric="cosine",
             align=True,
             enforce_detection=False
         )
-        arc_dist = float(res_arc.get("distance", 1.0))
-    except Exception:
-        pass
-
-    try:
-        res_vgg = DeepFace.verify(
-            img1_path=p1,
-            img2_path=p2,
-            model_name="VGG-Face",
-            detector_backend="retinaface",
-            distance_metric="cosine",
-            align=True,
-            enforce_detection=False
-        )
-        vgg_dist = float(res_vgg.get("distance", 1.0))
+        distance = float(res.get("distance", 1.0))
     except Exception:
         pass
     finally:
@@ -344,21 +329,21 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
             if os.path.exists(p):
                 os.remove(p)
 
-    verified = bool((arc_dist <= 0.78) or (vgg_dist <= 0.48))
+    verified = bool(distance <= threshold)
 
     return {
         "verified": verified,
-        "arcface_distance": arc_dist,
-        "vgg_distance": vgg_dist
+        "distance": distance,
+        "threshold": threshold
     }
 
 st.markdown('<div class="hero-title">🛡️ VerifAI — Identity & Document Forensics</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">RetinaFace Aligned Biometrics & Checksum Analysis</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">Decoupled Document Verification & Invariant Biometric Matching</div>', unsafe_allow_html=True)
 st.write("")
 
 with st.sidebar:
     st.markdown("### ⚙️ Engine Settings")
-    doc_selection = st.selectbox("Document Detection Mode", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
+    doc_selection = st.selectbox("Document Selection", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
 
 col1, col2 = st.columns(2)
 with col1:
@@ -387,7 +372,7 @@ if run:
             doc_img.thumbnail((max_size, max_size))
         doc_np = np.array(doc_img)
 
-        with st.spinner("Executing RetinaFace alignment and document verification..."):
+        with st.spinner("Analyzing document and biometric data..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
 
@@ -427,7 +412,7 @@ if run:
             if selfie_input is not None:
                 if face_crop is None:
                     bio_status = "FAILED"
-                    doc_reasons.append("RetinaFace was unable to extract a face crop from the ID")
+                    doc_reasons.append("Unable to crop clear portrait from ID")
                 else:
                     selfie_img = Image.open(selfie_input).convert("RGB")
                     selfie_np = np.array(selfie_img)
@@ -461,8 +446,7 @@ if run:
                 "Biometric Status": bio_status
             }
             if bio_result:
-                audit_log["ArcFace Cosine Distance"] = f"{bio_result['arcface_distance']:.4f} (Threshold: 0.78)"
-                audit_log["VGG-Face Distance"] = f"{bio_result['vgg_distance']:.4f} (Threshold: 0.48)"
+                audit_log["Biometric Distance"] = f"{bio_result['distance']:.4f} (Threshold: {bio_result['threshold']:.4f})"
 
             st.markdown('<div class="mono-log">', unsafe_allow_html=True)
             st.json(audit_log)
@@ -474,5 +458,5 @@ if run:
             st.subheader("Visual Audits")
             st.image(masked_preview, caption="Redacted Document (PII Masked)", use_container_width=True)
             if face_crop is not None:
-                st.image(face_crop, caption="RetinaFace Cropped ID Portrait", width=150)
+                st.image(face_crop, caption="Extracted ID Photo Crop", width=150)
             st.markdown('</div>', unsafe_allow_html=True)
