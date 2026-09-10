@@ -1,5 +1,9 @@
 streamlit
 opencv-python-headless
+numpy
 easyocr
-pillow
 pyzbar
+deepface
+mediapipe
+pillow
+tensorflow-cpu
