@@ -4,7 +4,7 @@ numpy
 easyocr
 pyzbar
 deepface
-mediapipe
+mediapipe==0.10.21
 pillow
 tensorflow-cpu
 tf-keras
