@@ -629,7 +629,8 @@ if run:
                 "Document Detected": doc_type,
                 "Verdict": final_verdict,
                 "Trust Score": f"{trust_score}%",
-                "Printed DOB": ocr_dob,
+                "Printed DOB (OCR)": ocr_dob,
+                "QR DOB": qr_data.get("dob", "No DOB field in QR") if isinstance(qr_data, dict) else "No QR decoded",
                 "Physical/Digital Tampering": "DETECTED" if is_tampered else "CLEAN",
                 "Issues Flagged": reasons if reasons else ["None - all integrity checks passed"],
             }
