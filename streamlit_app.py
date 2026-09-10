@@ -159,7 +159,32 @@ def check_tampering(img_np):
     ela_gray = cv2.cvtColor(ela, cv2.COLOR_RGB2GRAY)
     return bool(np.mean(ela_gray) > 14.0 and np.max(ela_gray) > 85), ela_gray
 
+def check_localized_tampering(img_np, ocr_boxes):
+    _, enc = cv2.imencode('.jpg', img_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    resaved = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+    ela_full = cv2.cvtColor(cv2.absdiff(img_np, resaved), cv2.COLOR_RGB2GRAY)
 
+    region_stats = []
+    for bbox, text, conf in ocr_boxes:
+        pts = np.array(bbox, np.int32)
+        x, y, w, h = cv2.boundingRect(pts)
+        if w < 6 or h < 6:
+            continue
+        crop = ela_full[y:y + h, x:x + w]
+        if crop.size == 0:
+            continue
+        region_stats.append((text, float(np.mean(crop))))
+
+    flagged = []
+    if len(region_stats) >= 3:
+        means = [m for _, m in region_stats]
+        median_m = float(np.median(means))
+        mad = float(np.median([abs(m - median_m) for m in means])) + 1e-6
+        for text, m in region_stats:
+            z_score = abs(m - median_m) / (mad * 1.4826)
+            if z_score > 3.0 and m > median_m + 4:
+                flagged.append((text, m, z_score))
+    return flagged
 # ============================================================
 #  QR / BARCODE PARSING
 # ============================================================
@@ -535,6 +560,9 @@ if run:
             qr_objects = decode(doc_img)
             qr_data = parse_qr_data(qr_objects)
             is_tampered, ela_map = check_tampering(doc_np)
+            localized_flags = check_localized_tampering(doc_np, ocr_boxes)
+            if localized_flags:
+                is_tampered = True
 
             dob_match = re.search(r'\b(0[1-9]|[12][0-9]|3[01])[-/.](0[1-9]|1[012])[-/.](19|20)\d\d\b', raw_text)
             ocr_dob = dob_match.group(0) if dob_match else "NOT_FOUND"
