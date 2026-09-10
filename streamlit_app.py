@@ -134,7 +134,6 @@ def parse_qr_data(qr_objs):
                 root = ET.fromstring(decoded_text)
                 return {
                     "type": "aadhaar_xml",
-                    "uid": root.attrib.get("uid", ""),
                     "dob": root.attrib.get("dob", "") or root.attrib.get("yob", ""),
                     "name": root.attrib.get("name", "")
                 }
@@ -171,7 +170,7 @@ def detect_doc_type(raw_text, ocr_boxes, qr_data=None):
     if qr_data and isinstance(qr_data, dict) and qr_data.get("type") == "aadhaar_xml":
         return "Aadhaar Card"
 
-    aadhaar_keywords = ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "ENROLMENT", "HELP@UIDAI"]
+    aadhaar_keywords = ["AADHAAR", "AADHAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR", "UIDAI", "ENROLMENT", "HELP@UIDAI", "GOVERNMENT OF INDIA"]
     has_aadhaar_kw = any(k in raw_text for k in aadhaar_keywords)
 
     all_digits = re.sub(r'\D', '', raw_text)
@@ -185,7 +184,7 @@ def detect_doc_type(raw_text, ocr_boxes, qr_data=None):
     if has_aadhaar_kw or has_valid_aadhaar_checksum:
         return "Aadhaar Card"
 
-    pan_keywords = ["INCOME TAX", "PERMANENT ACCOUNT", "INCOMETAX", "GOVT. OF INDIA"]
+    pan_keywords = ["INCOME TAX", "PERMANENT ACCOUNT", "INCOMETAX"]
     has_pan_kw = any(k in raw_text for k in pan_keywords)
 
     has_valid_pan_format = False
@@ -197,12 +196,7 @@ def detect_doc_type(raw_text, ocr_boxes, qr_data=None):
                     has_valid_pan_format = True
                     break
 
-    if has_pan_kw and has_valid_pan_format:
-        return "PAN Card"
-
-    if has_pan_kw:
-        return "PAN Card"
-    if has_valid_pan_format:
+    if has_pan_kw or has_valid_pan_format:
         return "PAN Card"
 
     return "Unrecognized"
@@ -245,7 +239,7 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob):
 
     if not extracted_uid:
         valid = False
-        reasons.append("Aadhaar checksum integrity failed (Verhoeff check)")
+        reasons.append("Aadhaar checksum integrity verification failed (Verhoeff check)")
 
     if not any(k in raw_text for k in ["GOVERNMENT OF INDIA", "UNIQUE IDENTIFICATION", "AADHAAR", "AADHAR", "MERA AADHAAR", "UIDAI"]):
         valid = False
@@ -267,9 +261,9 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob):
 
             if not dob_matches:
                 valid = False
-                reasons.append(f"DOB Mismatch: Physical ID ({ocr_dob}) contradicts QR record ({qr_dob})")
+                reasons.append(f"DOB Mismatch: Physical Card ({ocr_dob}) conflicts with QR record ({qr_dob})")
 
-    return valid, reasons, extracted_uid
+    return valid, reasons
 
 def preprocess_face(face_rgb):
     if face_rgb is None or face_rgb.size == 0:
@@ -283,24 +277,26 @@ def preprocess_face(face_rgb):
     return cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
 
 def extract_face(img_np):
-    try:
-        faces = DeepFace.extract_faces(
-            img_np, 
-            detector_backend='opencv', 
-            align=True, 
-            enforce_detection=False
-        )
-        if faces and len(faces) > 0:
-            fa = faces[0]['facial_area']
-            x, y, w, h = fa['x'], fa['y'], fa['w'], fa['h']
-            H, W, _ = img_np.shape
-            pad = int(min(w, h) * 0.15)
-            x0, y0 = max(x - pad, 0), max(y - pad, 0)
-            x1, y1 = min(x + w + pad, W), min(y + h + pad, H)
-            cropped = img_np[y0:y1, x0:x1]
-            return preprocess_face(cropped)
-    except Exception:
-        pass
+    for detector in ['retinaface', 'opencv']:
+        try:
+            faces = DeepFace.extract_faces(
+                img_np, 
+                detector_backend=detector, 
+                align=True, 
+                enforce_detection=False
+            )
+            if faces and len(faces) > 0:
+                fa = faces[0]['facial_area']
+                x, y, w, h = fa['x'], fa['y'], fa['w'], fa['h']
+                H, W, _ = img_np.shape
+                pad = int(min(w, h) * 0.15)
+                x0, y0 = max(x - pad, 0), max(y - pad, 0)
+                x1, y1 = min(x + w + pad, W), min(y + h + pad, H)
+                cropped = img_np[y0:y1, x0:x1]
+                if cropped.size > 0:
+                    return preprocess_face(cropped)
+        except Exception:
+            continue
     return None
 
 def analyze_biometrics(doc_face_rgb, selfie_rgb):
@@ -321,7 +317,7 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
             img1_path=p1,
             img2_path=p2,
             model_name="ArcFace",
-            detector_backend="opencv",
+            detector_backend="retinaface",
             distance_metric="cosine",
             align=True,
             enforce_detection=False
@@ -335,7 +331,7 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
             img1_path=p1,
             img2_path=p2,
             model_name="VGG-Face",
-            detector_backend="opencv",
+            detector_backend="retinaface",
             distance_metric="cosine",
             align=True,
             enforce_detection=False
@@ -357,12 +353,12 @@ def analyze_biometrics(doc_face_rgb, selfie_rgb):
     }
 
 st.markdown('<div class="hero-title">🛡️ VerifAI — Identity & Document Forensics</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Decoupled Document Verification & Biometric Cross-Analysis</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">RetinaFace Aligned Biometrics & Checksum Analysis</div>', unsafe_allow_html=True)
 st.write("")
 
 with st.sidebar:
-    st.markdown("### ⚙️ Detection Settings")
-    override_type = st.selectbox("Document Selection", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
+    st.markdown("### ⚙️ Engine Settings")
+    doc_selection = st.selectbox("Document Detection Mode", ["Auto-Detect", "Aadhaar Card", "PAN Card"])
 
 col1, col2 = st.columns(2)
 with col1:
@@ -391,7 +387,7 @@ if run:
             doc_img.thumbnail((max_size, max_size))
         doc_np = np.array(doc_img)
 
-        with st.spinner("Analyzing document authenticity and checking biometrics..."):
+        with st.spinner("Executing RetinaFace alignment and document verification..."):
             ocr_boxes = reader.readtext(doc_np, paragraph=False)
             raw_text = " ".join([b[1] for b in ocr_boxes]).upper()
 
@@ -404,8 +400,8 @@ if run:
             dates_found = extract_dates(raw_text)
             ocr_dob = dates_found[0] if dates_found else "NOT_FOUND"
 
-            if override_type != "Auto-Detect":
-                doc_type = override_type
+            if doc_selection != "Auto-Detect":
+                doc_type = doc_selection
             else:
                 doc_type = detect_doc_type(raw_text, ocr_boxes, qr_data)
 
@@ -415,7 +411,7 @@ if run:
             if doc_type == "PAN Card":
                 doc_valid, doc_reasons = validate_pan(raw_text, ocr_boxes)
             elif doc_type == "Aadhaar Card":
-                doc_valid, doc_reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob)
+                doc_valid, doc_reasons = validate_aadhaar(raw_text, qr_data, ocr_dob)
             else:
                 doc_valid = False
                 doc_reasons.append("Document not recognized as a valid government ID")
@@ -431,7 +427,7 @@ if run:
             if selfie_input is not None:
                 if face_crop is None:
                     bio_status = "FAILED"
-                    doc_reasons.append("Face not clearly detected on document photo for comparison")
+                    doc_reasons.append("RetinaFace was unable to extract a face crop from the ID")
                 else:
                     selfie_img = Image.open(selfie_input).convert("RGB")
                     selfie_np = np.array(selfie_img)
@@ -465,7 +461,7 @@ if run:
                 "Biometric Status": bio_status
             }
             if bio_result:
-                audit_log["ArcFace Distance"] = f"{bio_result['arcface_distance']:.4f} (Threshold: 0.78)"
+                audit_log["ArcFace Cosine Distance"] = f"{bio_result['arcface_distance']:.4f} (Threshold: 0.78)"
                 audit_log["VGG-Face Distance"] = f"{bio_result['vgg_distance']:.4f} (Threshold: 0.48)"
 
             st.markdown('<div class="mono-log">', unsafe_allow_html=True)
@@ -478,5 +474,5 @@ if run:
             st.subheader("Visual Audits")
             st.image(masked_preview, caption="Redacted Document (PII Masked)", use_container_width=True)
             if face_crop is not None:
-                st.image(face_crop, caption="Extracted ID Photo Crop", width=150)
+                st.image(face_crop, caption="RetinaFace Cropped ID Portrait", width=150)
             st.markdown('</div>', unsafe_allow_html=True)
