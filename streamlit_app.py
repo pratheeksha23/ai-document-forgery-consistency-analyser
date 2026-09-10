@@ -7,7 +7,6 @@ import xml.etree.ElementTree as ET
 from PIL import Image
 from pyzbar.pyzbar import decode
 from deepface import DeepFace
-import mediapipe as mp
 import tempfile
 import os
 
@@ -81,7 +80,6 @@ def load_ocr():
     return easyocr.Reader(['en'], gpu=False, model_storage_directory="./models", download_enabled=True)
 
 reader = load_ocr()
-mp_face_mesh = mp.solutions.face_mesh
 
 d_table = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
@@ -190,10 +188,8 @@ def extract_dates(text):
         r'\b(19|20)\d\d\b'
     ]
     for p in patterns:
-        matches = re.findall(p, text)
-        if matches:
-            for m in re.finditer(p, text):
-                dates.append(m.group(0))
+        for m in re.finditer(p, text):
+            dates.append(m.group(0))
     return dates
 
 def detect_doc_type(raw_text, clean_alnum, qr_data=None):
@@ -246,7 +242,7 @@ def validate_pan(raw_text, clean_alnum):
         reasons.append("Missing Income Tax Department validation headers")
     return valid, reasons
 
-def validate_aadhaar(raw_text, qr_data, ocr_dob, ocr_boxes):
+def validate_aadhaar(raw_text, qr_data, ocr_dob):
     reasons, valid = [], True
     all_digits = re.sub(r'\D', '', raw_text)
     extracted_uid = ""
@@ -285,43 +281,64 @@ def validate_aadhaar(raw_text, qr_data, ocr_dob, ocr_boxes):
 
     return valid, reasons, extracted_uid
 
+def preprocess_face(face_rgb):
+    if face_rgb is None or face_rgb.size == 0:
+        return None
+    face_resized = cv2.resize(face_rgb, (224, 224), interpolation=cv2.INTER_AREA)
+    lab = cv2.cvtColor(face_resized, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+
 def extract_face(img_np):
     try:
-        faces = DeepFace.extract_faces(img_np, detector_backend='opencv', enforce_detection=False)
+        faces = DeepFace.extract_faces(
+            img_np, 
+            detector_backend='opencv', 
+            align=True, 
+            enforce_detection=False
+        )
         if faces and len(faces) > 0:
             fa = faces[0]['facial_area']
             x, y, w, h = fa['x'], fa['y'], fa['w'], fa['h']
             H, W, _ = img_np.shape
-            pad = int(min(w, h) * 0.1)
+            pad = int(min(w, h) * 0.15)
             x0, y0 = max(x - pad, 0), max(y - pad, 0)
             x1, y1 = min(x + w + pad, W), min(y + h + pad, H)
-            face = img_np[y0:y1, x0:x1]
-            if face.size > 0:
-                return face
+            cropped = img_np[y0:y1, x0:x1]
+            return preprocess_face(cropped)
     except Exception:
         pass
     return None
 
-def analyze_biometrics(doc_face_rgb, selfie_rgb, model_name="Facenet512"):
+def analyze_biometrics(doc_face_rgb, selfie_rgb):
+    norm_doc = preprocess_face(doc_face_rgb)
+    norm_selfie = preprocess_face(selfie_rgb)
+
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f1, \
          tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f2:
-        cv2.imwrite(f1.name, cv2.cvtColor(doc_face_rgb, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(f2.name, cv2.cvtColor(selfie_rgb, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(f1.name, cv2.cvtColor(norm_doc, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(f2.name, cv2.cvtColor(norm_selfie, cv2.COLOR_RGB2BGR))
         p1, p2 = f1.name, f2.name
 
-    deepface_verified, distance, threshold = False, 1.0, 0.40
+    deepface_verified = False
+    distance = 1.0
+    threshold = 0.65
+
     try:
         res = DeepFace.verify(
             img1_path=p1,
             img2_path=p2,
-            model_name=model_name,
-            detector_backend='opencv',
-            distance_metric='cosine',
+            model_name="ArcFace",
+            detector_backend="opencv",
+            distance_metric="cosine",
+            align=True,
             enforce_detection=False
         )
-        deepface_verified = res.get("verified", False)
         distance = float(res.get("distance", 1.0))
-        threshold = float(res.get("threshold", 0.40))
+        deepface_verified = bool(distance <= threshold)
     except Exception:
         pass
     finally:
@@ -424,7 +441,7 @@ if run:
             if doc_type == "PAN Card":
                 metadata_valid, reasons = validate_pan(raw_text, clean_alnum)
             elif doc_type == "Aadhaar Card":
-                metadata_valid, reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob, ocr_boxes)
+                metadata_valid, reasons, _ = validate_aadhaar(raw_text, qr_data, ocr_dob)
             else:
                 metadata_valid = False
                 reasons.append("Document could not be recognized as a valid PAN or Aadhaar card")
@@ -443,7 +460,7 @@ if run:
                 else:
                     selfie_img = Image.open(selfie_input).convert("RGB")
                     selfie_np = np.array(selfie_img)
-                    biometric_result = analyze_biometrics(face_crop, selfie_np, model_name="Facenet512")
+                    biometric_result = analyze_biometrics(face_crop, selfie_np)
                     if not biometric_result["deepface_verified"]:
                         metadata_valid = False
                         reasons.append("Biometric mismatch: ID portrait does not match selfie")
