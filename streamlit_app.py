@@ -202,11 +202,28 @@ def mask_pii(img_np, boxes):
 # ============================================================
 #  DOCUMENT TYPE DETECTION + VALIDATION
 # ============================================================
-def detect_doc_type(raw_text, clean_alnum):
+def detect_doc_type(raw_text, clean_alnum, qr_data=None):
+    # Strong, low-false-positive signals first — these override keyword counting
+    if qr_data and isinstance(qr_data, dict) and "uid" in qr_data:
+        return "Aadhaar Card"  # Aadhaar QR (PrintLetterBarcodeData) is Aadhaar-specific
+
+    all_digits = re.sub(r'\D', '', raw_text)
+    for i in range(max(len(all_digits) - 11, 0)):
+        c = all_digits[i:i + 12]
+        if len(c) == 12 and c[0] not in '01' and validate_verhoeff(c):
+            return "Aadhaar Card"  # checksum-valid 12-digit Aadhaar number
+
+    pan_hits = re.findall(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', clean_alnum)
+    if pan_hits and pan_hits[0][3] in "PCHFATBLJG" and any(
+        k in raw_text for k in ["INCOME TAX", "PERMANENT ACCOUNT", "GOVT. OF INDIA", "GOVERNMENT OF INDIA"]
+    ):
+        return "PAN Card"  # structurally valid PAN + tax-department header, not just a loose regex hit
+
+    # Fall back to keyword scoring only when no strong structural signal was found
     scores = {"PAN Card": 0, "Aadhaar Card": 0, "Driving Licence": 0, "Voter ID": 0}
-    if any(k in raw_text for k in ["INCOME TAX", "PERMANENT ACCOUNT", "FATHER"]) or re.search(r'[A-Z]{5}[0-9]{4}[A-Z]{1}', clean_alnum):
-        scores["PAN Card"] += 2
-    if any(k in raw_text for k in ["AADHAAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR"]) or re.search(r'\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b', raw_text):
+    if any(k in raw_text for k in ["INCOME TAX", "PERMANENT ACCOUNT", "FATHER"]) or pan_hits:
+        scores["PAN Card"] += 1
+    if any(k in raw_text for k in ["AADHAAR", "UNIQUE IDENTIFICATION", "MERA AADHAAR"]):
         scores["Aadhaar Card"] += 2
     if any(k in raw_text for k in ["DRIVING LICENCE", "DRIVING LICENSE", "TRANSPORT DEPARTMENT", "MCWG", "LMV", "NON TRANSPORT"]):
         scores["Driving Licence"] += 2
@@ -522,7 +539,7 @@ if run:
             dob_match = re.search(r'\b(0[1-9]|[12][0-9]|3[01])[-/.](0[1-9]|1[012])[-/.](19|20)\d\d\b', raw_text)
             ocr_dob = dob_match.group(0) if dob_match else "NOT_FOUND"
 
-            doc_type = doc_type_choice if doc_type_choice != "Auto-Detect" else detect_doc_type(raw_text, clean_alnum)
+            doc_type = doc_type_choice if doc_type_choice != "Auto-Detect" else detect_doc_type(raw_text, clean_alnum, qr_data)
 
             reasons = []
             metadata_valid = True
